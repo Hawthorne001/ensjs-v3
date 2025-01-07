@@ -1,7 +1,8 @@
 // from https://github.com/wagmi-dev/viem/blob/main/scripts/prepublishOnly.ts
 
 /* eslint-disable no-continue */
-import fs from 'fs-extra'
+import jsonFs from 'jsonfile'
+import fs from 'node:fs'
 import path from 'path'
 import * as url from 'url'
 
@@ -14,9 +15,9 @@ type Exports = {
 // Generates a package.json to be published to NPM with only the necessary fields.
 function generatePackageJson() {
   const packageJsonPath = path.join(__dirname, '../package.json')
-  const tmpPackageJson = fs.readJsonSync(packageJsonPath)
+  const tmpPackageJson = jsonFs.readFileSync(packageJsonPath)
 
-  fs.writeJsonSync(`${packageJsonPath}.tmp`, tmpPackageJson, { spaces: 2 })
+  jsonFs.writeFileSync(`${packageJsonPath}.tmp`, tmpPackageJson, { spaces: 2 })
 
   const {
     name,
@@ -48,10 +49,11 @@ function generatePackageJson() {
     if (key === '.') continue
     if (!value.default || !value.import)
       throw new Error('`default` and `import` are required.')
-
-    fs.outputFileSync(
-      `${key}/package.json`,
-      `{
+    if (!fs.existsSync(key)) fs.mkdirSync(key)
+    if (!fs.existsSync(`${key}/package.json`))
+      fs.writeFileSync(
+        `${key}/package.json`,
+        `{
   ${Object.entries(value)
     .map(([k, v]) => {
       const key_ = (() => {
@@ -64,11 +66,11 @@ function generatePackageJson() {
     })
     .join(',\n  ')}
 }`,
-    )
+      )
     files_.push(key.replace('./', ''))
   }
 
-  fs.writeJsonSync(
+  jsonFs.writeFileSync(
     packageJsonPath,
     {
       name,

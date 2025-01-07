@@ -1,9 +1,9 @@
 /* eslint-disable */
-import { spawn } from 'child_process'
+import { spawn } from 'node:child_process'
 import concurrently from 'concurrently'
-import compose from 'docker-compose'
-import fetch from 'node-fetch'
-import { Transform } from 'stream'
+import composev1 from 'docker-compose'
+import composev2 from 'docker-compose/dist/v2.js'
+import { Transform } from 'node:stream'
 import waitOn from 'wait-on'
 import { main as fetchData } from './fetch-data.js'
 
@@ -22,6 +22,16 @@ const opts = {
   composeOptions: ['-p', 'ens-test-env'],
 }
 let verbosity = 0
+
+const getCompose = async () => {
+  const versionv1 = await composev1.version().catch(() => null)
+  if (versionv1) return composev1
+
+  const versionv2 = await composev2.version().catch(() => null)
+  if (versionv2) return composev2
+
+  throw new Error('No docker-compose found, or docker not running?')
+}
 
 /**
  * @type {import('concurrently').Command[]}
@@ -45,6 +55,7 @@ const rpcFetch = (method, params) =>
   batchRpcFetch([{ method, params }]).then((res) => res[0])
 
 async function cleanup(_, exitCode) {
+  const compose = await getCompose()
   let force = false
   if (cleanupRunning) {
     if (exitCode === 'SIGINT') {
@@ -146,6 +157,7 @@ const awaitCommand = async (name, command) => {
     deploy.stdout.pipe(outPrepender).pipe(process.stdout)
   }
   deploy.stderr.pipe(errPrepender).pipe(process.stderr)
+  deploy.stderr.on('data', cleanup.bind(null, { exit: true }))
   return new Promise((resolve) => deploy.on('exit', () => resolve()))
 }
 
@@ -174,7 +186,10 @@ export const main = async (_config, _options, justKill) => {
     opts.env.ANVIL_EXTRA_ARGS = '--tracing'
   }
 
+  const compose = await getCompose()
+
   try {
+    console.log('Starting anvil...')
     await compose.upOne('anvil', opts)
   } catch (e) {
     console.error('e: ', e)
@@ -266,10 +281,61 @@ export const main = async (_config, _options, justKill) => {
 
   if (options.graph) {
     try {
+      console.log('Starting graph-node...')
+      await compose.upOne('graph-node', opts)
+
+      await waitOn({ resources: ['http://localhost:8040'] })
+
+      const latestBlock = await rpcFetch('eth_getBlockByNumber', ['latest', false])
+      const latestBlockNumber = parseInt(latestBlock.result.number, 16)
+      if (Number.isNaN(latestBlockNumber)) {
+        console.error('Failed to fetch latest block number')
+        return cleanup(undefined, 0)
+      }
+      console.log('latest block number:', latestBlockNumber)
+
+      let indexArray = []
+      const getCurrentIndex = async () =>
+        fetch('http://localhost:8000/subgraphs/name/graphprotocol/ens', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            query: `
+            {
+              _meta {
+                block {
+                  number
+                }
+              }
+            }
+          `,
+            variables: {},
+          }),
+        })
+          .then((res) => res.json())
+          .then((res) => {
+            if (res.errors) return 0
+            return res.data._meta.block.number
+          })
+          .catch(() => 0)
+      do {
+        const index = await getCurrentIndex()
+        console.log('subgraph index:', index)
+        indexArray.push(await getCurrentIndex())
+        if (indexArray.length > 10) indexArray.shift()
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        if (indexArray.every((i) => i === indexArray[0]) && indexArray.length === 10) {
+          console.error('Subgraph failed to launch properly')
+          return cleanup(undefined, 0)
+        }
+      } while (
+        indexArray[indexArray.length - 1] < latestBlockNumber
+      )
+      console.log('Starting remaining docker containers...')
       await compose.upAll(opts)
     } catch {}
-
-    await waitOn({ resources: ['http://localhost:8040'] })
 
     if (options.save) {
       const internalHashes = [
@@ -323,48 +389,12 @@ export const main = async (_config, _options, justKill) => {
           'http-get://localhost:8000/subgraphs/name/graphprotocol/ens',
         ],
       })
-      await new Promise((resolve) => setTimeout(resolve, 100))
     }
   }
 
+  await new Promise((resolve) => setTimeout(resolve, 100))
+
   if (!options.save && cmdsToRun.length > 0 && options.scripts) {
-    if (options.graph) {
-      let indexArray = []
-      const getCurrentIndex = async () =>
-        fetch('http://localhost:8000/subgraphs/name/graphprotocol/ens', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            query: `
-            {
-              _meta {
-                block {
-                  number
-                }
-              }
-            }
-          `,
-            variables: {},
-          }),
-        })
-          .then((res) => res.json())
-          .then((res) => {
-            if (res.errors) return 0
-            return res.data._meta.block.number
-          })
-          .catch(() => 0)
-      do {
-        indexArray.push(await getCurrentIndex())
-        if (indexArray.length > 10) indexArray.shift()
-        await new Promise((resolve) => setTimeout(resolve, 100))
-      } while (
-        !indexArray.every((i) => i === indexArray[0]) ||
-        indexArray.length < 2 ||
-        indexArray[0] === 0
-      )
-    }
     /**
      * @type {import('concurrently').ConcurrentlyResult['result']}
      **/
